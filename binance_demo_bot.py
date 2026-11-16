@@ -50,21 +50,11 @@ SYMBOLS = [
     "ETH/USDT:USDT",
     "SOL/USDT:USDT",
     "XRP/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "1000SATS/USDT:USDT",
-    "1000PEPE/USDT:USDT",
-    "1000SHIB/USDT:USDT",
-    "1000BONK/USDT:USDT",
-    "1000FLOKI/USDT:USDT",
-    "1000RATS/USDT:USDT",
-    "MEME/USDT:USDT",
-    "BOME/USDT:USDT",
-    "TURBO/USDT:USDT",
-    "NEIRO/USDT:USDT",
-    "PENGU/USDT:USDT",
+    "DOGE/USDT:USDT"
+  
 ]
-MAX_OPEN_TRADES = 1000     # maximum simultaneous open positions across all symbols
-TIMEFRAME = "1m"           # 1m = many trades but noisy; "5m" or "15m" = fewer, cleaner
+MAX_OPEN_TRADES = 100    # maximum simultaneous open positions across all symbols
+TIMEFRAME = "15m"           # 1m = many trades but noisy; "5m" or "15m" = fewer, cleaner
 
 # --- Supertrend ---
 ST_ATR_LEN = 10
