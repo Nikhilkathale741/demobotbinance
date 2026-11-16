@@ -34,9 +34,12 @@ try:
 except ImportError:  # news feed is optional
     requests = None
 
-# ============================ CONFIG ============================
-API_KEY = os.getenv("BINANCE_DEMO_API_KEY")
-SECRET = os.getenv("BINANCE_DEMO_SECRET_KEY")
+# # ============================ CONFIG ============================
+# API_KEY = os.getenv("BINANCE_DEMO_API_KEY")
+# SECRET = os.getenv("BINANCE_DEMO_SECRET_KEY")
+  API_KEY="y0Bq5TgbczyigCOHbrn1w4HsV9TeIDfSrihjClFYXb46TdRVpWhvExrqRUCvhHrs"
+SECRET="6SeYcngOGJWvg9HAQOZKh7Df2956eVGYbJtEkTa3Kpbk3FgeX8hRyfsJiBrybvgy"
+
 
 # "demo"    -> Binance Demo Trading keys (demo.binance.com)
 # "testnet" -> Futures testnet keys (testnet.binancefuture.com)
