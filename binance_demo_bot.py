@@ -1,30 +1,39 @@
 """
-Binance DEMO USDT-M futures bot — Chan-inspired intraday mean reversion.
-DEMO ONLY by default. Market entries and bot-managed market exits (no resting orders).
+Binance DEMO USDT-M Futures bot — Chan-inspired intraday mean reversion.
+DEMO ONLY. This script intentionally has no live-trading mode.
 
-Strategy:
-- On the last CLOSED 1-minute candle, fit a rolling linear trend to log price.
-- Calculate the current log-price residual z-score versus the rolling residual distribution.
-- Require the residual series to pass a rolling Augmented Dickey-Fuller stationarity check.
-- Long when z-score crosses back above -ENTRY_Z after being <= -ENTRY_Z.
-- Short when z-score crosses back below +ENTRY_Z after being >= +ENTRY_Z.
-- Optional volatility-spike guard.
-- Exit at equal-distance stop/target: 2% ROI on isolated margin at configured leverage.
-- Position size targets 1% of current USDT futures equity at the stop, subject to exchange precision.
-- Only BTC, ETH, SOL. One open position at a time to cap aggregate exposure.
+Risk controls added:
+- IST trading day (Asia/Kolkata) reset.
+- Maximum 3 entries per IST day.
+- Stop new entries after 2 losing trades in the IST day (not necessarily consecutive).
+- Daily drawdown stop at 2.5% from start-of-day futures equity.
+- Overall drawdown halt at 8% from persisted equity high-water mark.
+- Close an active bot-managed position with a reduce-only market order on either
+  drawdown breach; overall breach permanently halts new trading until manual review.
+- 15-minute per-symbol cooldown after a losing trade.
+- Persisted risk state, daily counters, cooldowns, high-water mark and processed candles.
+- Daily Telegram text + PDF report at 23:59 IST, with separate delivery flags.
 
-Important:
-This is an implementation inspired by quantitative mean-reversion concepts discussed by
-Ernest P. Chan, not a reproduction of a proprietary strategy or a claim of profitability.
-Bot-managed exits require this process and network connection to remain online.
+Important safety limitations:
+- Entries/exits are market orders.
+- Stop-loss/take-profit and drawdown exits are bot-managed, not exchange-side
+  protective orders. The process and network must remain available.
+- If an exchange position cannot be reconciled with the saved active state, the
+  bot halts rather than guessing or taking over an unknown position.
+- DEMO mode only. Validate all behavior in Binance Demo before any other use.
 """
 
 import os
 import csv
 import json
 import time
+import uuid
 import logging
-from datetime import datetime, timezone
+import mimetypes
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import ccxt
 import numpy as np
@@ -34,20 +43,30 @@ from statsmodels.tsa.stattools import adfuller
 # ============================ CONFIG ============================
 API_KEY = os.getenv("BINANCE_DEMO_API_KEY")
 SECRET = os.getenv("BINANCE_DEMO_SECRET_KEY")
-MODE = "demo"  # "demo" or "testnet"; never change to live until separately reviewed.
+MODE = "demo"  # Intentionally fixed to Binance Demo Trading; no live mode exists.
 
-SYMBOLS = [
+CANDIDATE_SYMBOLS = [
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
     "SOL/USDT:USDT",
+    "XRP/USDT:USDT",
+    "BNB/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "LINK/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "ADA/USDT:USDT",
+    "ZEC/USDT:USDT",
+    "HYPE/USDT:USDT",
+    "NEAR/USDT:USDT",
 ]
+SYMBOLS = []  # populated by validate_symbols()
 
 TIMEFRAME = "1m"
 CANDLE_LIMIT = 300
 POLL_SECONDS = 2
-MAX_OPEN_TRADES = 1  # scan all 3 symbols, but only hold one position at a time.
+MAX_OPEN_TRADES = 1
 
-# Chan-inspired residual mean reversion
+# Chan-inspired residual mean reversion (unchanged)
 REGRESSION_WINDOW = 120
 ZSCORE_WINDOW = 60
 ENTRY_Z = 2.0
@@ -56,31 +75,115 @@ ADF_CHECK_EVERY_CANDLES = 5
 MAX_CANDLE_RANGE_ATR = 3.0
 ATR_LEN = 14
 
-# Risk / exits
-RISK_PCT = 1.0                 # account equity risk target at stop
-STOP_ROI_PCT = 2.0             # loss target as % of allocated initial margin
-TAKE_PROFIT_ROI_PCT = 2.0      # equal to stop for 1:1 R:R
+# Position risk / exits (existing settings retained)
+RISK_PCT = 1.0
+STOP_ROI_PCT = 2.0
+TAKE_PROFIT_ROI_PCT = 2.0
 LEVERAGE = 5
-MAX_DAILY_LOSS_PCT = 3.0
-MAX_CONSEC_LOSSES = 3
 MIN_BALANCE_USDT = 5.0
 
-# Reports / files
-REPORT_EVERY_N_TRADES = 5
+# Confirmed daily / account-level controls
+try:
+    IST = ZoneInfo("Asia/Kolkata")
+except ZoneInfoNotFoundError:  # Windows without the optional tzdata package
+    IST = timezone(timedelta(hours=5, minutes=30))  # India has no daylight-saving changes
+MAX_TRADES_PER_DAY = 3
+MAX_LOSING_TRADES_PER_DAY = 2
+DAILY_DRAWDOWN_LIMIT_PCT = 2.5
+OVERALL_DRAWDOWN_LIMIT_PCT = 8.0
+LOSS_COOLDOWN_MINUTES = 15
+DAILY_REPORT_HOUR = 23
+DAILY_REPORT_MINUTE = 59
+
+# Reports / persistence
+REPORT_EVERY_N_TRADES = 5  # retain the existing periodic PDF report as well
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADE_LOG_JSON = os.path.join(BASE_DIR, "trade_log.json")
 TRADE_LOG_CSV = os.path.join(BASE_DIR, "trades.csv")
-STATE_JSON = os.path.join(BASE_DIR, "active_trade_state.json")
+ACTIVE_STATE_JSON = os.path.join(BASE_DIR, "active_trade_state.json")
+RISK_STATE_JSON = os.path.join(BASE_DIR, "risk_state.json")
+DAILY_REPORT_DIR = os.path.join(BASE_DIR, "daily_reports")
+
+# Telegram credentials must be configured in local environment variables.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("chan_mean_reversion_bot")
+_EQUITY_FALLBACK_WARNED = False
+
+
+# --------------------------- time / persistence ---------------------------
+def now_ist():
+    return datetime.now(IST)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ist_now_iso():
+    return now_ist().isoformat()
+
+
+def ist_day_key(value=None):
+    value = value or now_ist()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=IST)
+    return value.astimezone(IST).date().isoformat()
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=IST)
+    except (TypeError, ValueError):
+        return None
+
+
+def atomic_write_json(path, payload):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_active_state(active):
+    atomic_write_json(ACTIVE_STATE_JSON, active or {})
+
+
+def load_active_state():
+    data = load_json(ACTIVE_STATE_JSON, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_risk_state(risk_state):
+    atomic_write_json(RISK_STATE_JSON, risk_state)
+
+
+def load_risk_state():
+    data = load_json(RISK_STATE_JSON, {})
+    return data if isinstance(data, dict) else {}
 
 
 # --------------------------- exchange ---------------------------
 def make_exchange():
     if not API_KEY or not SECRET:
         raise SystemExit(
-            "Missing credentials. Set BINANCE_DEMO_API_KEY and BINANCE_DEMO_SECRET_KEY."
+            "Missing Binance Demo credentials. Set BINANCE_DEMO_API_KEY and BINANCE_DEMO_SECRET_KEY."
         )
     ex = ccxt.binanceusdm({
         "apiKey": API_KEY,
@@ -88,25 +191,33 @@ def make_exchange():
         "enableRateLimit": True,
         "options": {"defaultType": "future"},
     })
-    if MODE == "demo":
-        if not hasattr(ex, "enable_demo_trading"):
-            raise SystemExit("Installed ccxt does not support Binance Demo Trading. Upgrade ccxt.")
-        ex.enable_demo_trading(True)
-    elif MODE == "testnet":
-        ex.set_sandbox_mode(True)
-    else:
-        raise SystemExit("MODE must be 'demo' or 'testnet'. This script intentionally has no live mode.")
+    if not hasattr(ex, "enable_demo_trading"):
+        raise SystemExit("Installed ccxt does not support Binance Demo Trading. Upgrade ccxt.")
+    ex.enable_demo_trading(True)
     ex.load_markets()
     return ex
 
 
-def get_balance(ex):
-    bal = ex.fetch_balance()
-    usdt = bal.get("USDT") or {}
-    total = usdt.get("total")
-    if total is None:
-        raise RuntimeError("USDT futures wallet balance not found. Fund the Binance DEMO futures wallet.")
-    return float(total)
+def validate_symbols(ex):
+    supported, skipped = [], []
+    for symbol in CANDIDATE_SYMBOLS:
+        market = ex.markets.get(symbol)
+        if not market:
+            skipped.append((symbol, "not listed by Binance Demo market list"))
+            continue
+        if market.get("active") is False:
+            skipped.append((symbol, "market inactive"))
+            continue
+        if not (market.get("swap") and market.get("linear") and market.get("quote") == "USDT"):
+            skipped.append((symbol, "not an active USDT-margined linear perpetual"))
+            continue
+        supported.append(symbol)
+    for symbol, reason in skipped:
+        log.warning("[%s] Not scanning: %s", symbol, reason)
+    if not supported:
+        raise SystemExit("None of the 12 configured symbols are available as active USDT perpetuals.")
+    log.info("Validated %d/%d symbols: %s", len(supported), len(CANDIDATE_SYMBOLS), ", ".join(supported))
+    return supported
 
 
 def get_open_positions(ex):
@@ -122,52 +233,69 @@ def get_open_positions(ex):
     return positions
 
 
+def get_equity(ex):
+    """Return futures account equity (wallet balance + unrealized PnL where available)."""
+    global _EQUITY_FALLBACK_WARNED
+    balance = ex.fetch_balance()
+    info = balance.get("info") or {}
+    # Binance USD-M account response exposes totalMarginBalance, which includes unrealized PnL.
+    for key in ("totalMarginBalance", "totalWalletBalance"):
+        value = info.get(key)
+        if value not in (None, ""):
+            equity = float(value)
+            if key == "totalWalletBalance" and info.get("totalUnrealizedProfit") not in (None, ""):
+                equity += float(info["totalUnrealizedProfit"])
+            if np.isfinite(equity):
+                return equity
+    usdt = balance.get("USDT") or {}
+    total = usdt.get("total")
+    if total is None:
+        raise RuntimeError("Could not read USDT futures equity from Binance balance response.")
+    if not _EQUITY_FALLBACK_WARNED:
+        log.warning("Binance raw totalMarginBalance unavailable; using CCXT USDT total as equity fallback.")
+        _EQUITY_FALLBACK_WARNED = True
+    equity = float(total)
+    if not np.isfinite(equity):
+        raise RuntimeError("Binance returned non-finite USDT equity.")
+    return equity
+
+
 # --------------------------- indicators ---------------------------
 def add_atr(df, length=ATR_LEN):
     prev_close = df["close"].shift(1)
-    tr = pd.concat([
+    true_range = pd.concat([
         df["high"] - df["low"],
         (df["high"] - prev_close).abs(),
         (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1 / length, adjust=False).mean()
+    df["atr"] = true_range.ewm(alpha=1 / length, adjust=False).mean()
     return df
 
 
-def calculate_residual_zscore(close, regression_window=REGRESSION_WINDOW,
-                              z_window=ZSCORE_WINDOW):
-    """
-    Rolling log-price linear regression residual.
-    The z-score measures deviation from the local fitted trend, not raw price vs SMA.
-    """
+def calculate_residual_zscore(close, regression_window=REGRESSION_WINDOW, z_window=ZSCORE_WINDOW):
+    """Rolling log-price regression residual and its rolling z-score."""
     log_price = np.log(np.asarray(close, dtype=float))
     if len(log_price) < regression_window + z_window + 2:
         raise ValueError("Not enough candles for regression and z-score windows.")
-
     residuals = np.full(len(log_price), np.nan)
     x = np.arange(regression_window, dtype=float)
-
     for end in range(regression_window, len(log_price) + 1):
         y = log_price[end - regression_window:end]
         slope, intercept = np.polyfit(x, y, 1)
         residuals[end - 1] = y[-1] - (intercept + slope * x[-1])
-
     residual_series = pd.Series(residuals)
     mean = residual_series.rolling(z_window, min_periods=z_window).mean()
     std = residual_series.rolling(z_window, min_periods=z_window).std(ddof=1)
-    zscore = (residual_series - mean) / std.replace(0, np.nan)
-    return residual_series, zscore
+    return residual_series, (residual_series - mean) / std.replace(0, np.nan)
 
 
 _adf_cache = {}
 
 
 def stationarity_ok(residuals, symbol, candle_ts):
-    """Cache the ADF result for each symbol/candle; reject non-stationary residuals."""
     cached = _adf_cache.get(symbol)
     if cached and candle_ts - cached["ts"] < ADF_CHECK_EVERY_CANDLES * 60_000:
         return cached["ok"], cached["pvalue"]
-
     values = pd.Series(residuals).dropna().to_numpy(dtype=float)
     if len(values) < 50 or np.std(values) == 0:
         ok, pvalue = False, 1.0
@@ -179,17 +307,15 @@ def stationarity_ok(residuals, symbol, candle_ts):
         except Exception as exc:
             log.warning("[%s] ADF test failed: %s", symbol, exc)
             ok, pvalue = False, 1.0
-
     _adf_cache[symbol] = {"ts": candle_ts, "ok": ok, "pvalue": pvalue}
     return ok, pvalue
 
 
 def prepare_candles(raw):
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
-    # Ignore the currently forming candle; signals only use completed candles.
-    df = df.iloc[:-1].copy().reset_index(drop=True)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
+    df = df.iloc[:-1].copy().reset_index(drop=True)  # exclude forming candle
+    for column in ("open", "high", "low", "close", "volume"):
+        df[column] = df[column].astype(float)
     return add_atr(df)
 
 
@@ -197,280 +323,736 @@ def get_signal(df, symbol):
     required = REGRESSION_WINDOW + ZSCORE_WINDOW + ATR_LEN + 5
     if len(df) < required:
         return None, "not enough closed candles"
-
     residuals, zscores = calculate_residual_zscore(df["close"].to_numpy())
-    z = zscores.iloc[-1]
-    prev_z = zscores.iloc[-2]
+    z, previous_z = zscores.iloc[-1], zscores.iloc[-2]
     row = df.iloc[-1]
-
-    if pd.isna(z) or pd.isna(prev_z):
+    if pd.isna(z) or pd.isna(previous_z):
         return None, "z-score unavailable"
     if row["atr"] <= 0:
         return None, "ATR unavailable"
-
     candle_range = float(row["high"] - row["low"])
     if candle_range > MAX_CANDLE_RANGE_ATR * float(row["atr"]):
         return None, "volatility spike candle; skipping"
-
     stationary, pvalue = stationarity_ok(residuals, symbol, int(row["ts"]))
     if not stationary:
         return None, f"residual series not stationary (ADF p={pvalue:.3f})"
-
-    # Require a cross back inside the extreme band to avoid blindly catching a falling/rising knife.
-    if prev_z <= -ENTRY_Z and z > -ENTRY_Z:
+    if previous_z <= -ENTRY_Z and z > -ENTRY_Z:
         return ("buy", float(row["close"]), float(z)), (
-            f"Mean-reversion LONG: residual z-score crossed back above -{ENTRY_Z:.1f} "
-            f"({prev_z:.2f} -> {z:.2f}); ADF p={pvalue:.3f}"
+            f"Mean-reversion LONG: z crossed above -{ENTRY_Z:.1f} ({previous_z:.2f} -> {z:.2f}); ADF p={pvalue:.3f}"
         )
-    if prev_z >= ENTRY_Z and z < ENTRY_Z:
+    if previous_z >= ENTRY_Z and z < ENTRY_Z:
         return ("sell", float(row["close"]), float(z)), (
-            f"Mean-reversion SHORT: residual z-score crossed back below +{ENTRY_Z:.1f} "
-            f"({prev_z:.2f} -> {z:.2f}); ADF p={pvalue:.3f}"
+            f"Mean-reversion SHORT: z crossed below +{ENTRY_Z:.1f} ({previous_z:.2f} -> {z:.2f}); ADF p={pvalue:.3f}"
         )
-
     return None, f"no z-score re-entry (z={z:.2f}, ADF p={pvalue:.3f})"
 
 
-# --------------------------- trade persistence ---------------------------
+# --------------------------- trade log / fills ---------------------------
 def load_trade_log():
-    try:
-        with open(TRADE_LOG_JSON, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
+    data = load_json(TRADE_LOG_JSON, [])
+    return data if isinstance(data, list) else []
 
 
 def save_trade_log(trades):
-    with open(TRADE_LOG_JSON, "w", encoding="utf-8") as f:
-        json.dump(trades, f, indent=2)
-    cols = ["n", "symbol", "side", "opened_utc", "closed_utc", "entry", "exit",
-            "sl", "tp", "qty", "risk_usdt", "pnl_usdt", "r_multiple", "result", "reason"]
-    with open(TRADE_LOG_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+    atomic_write_json(TRADE_LOG_JSON, trades)
+    columns = [
+        "n", "symbol", "side", "opened_utc", "opened_ist", "closed_utc", "closed_ist",
+        "entry", "exit", "sl", "tp", "qty", "risk_usdt", "pnl_usdt", "pnl_accuracy", "risk_loss",
+        "entry_slippage_pct", "exit_slippage_pct",
+        "r_multiple", "result", "reason", "entry_order_id", "exit_order_id",
+    ]
+    tmp = TRADE_LOG_CSV + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
-        for trade in trades:
-            writer.writerow(trade)
-
-
-def save_active_state(active):
-    with open(STATE_JSON, "w", encoding="utf-8") as f:
-        json.dump(active, f, indent=2)
-
-
-def load_active_state():
-    try:
-        with open(STATE_JSON, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat()
+        writer.writerows(trades)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, TRADE_LOG_CSV)
 
 
 def fetch_fill_price(ex, symbol, order):
-    average = order.get("average") or order.get("price")
+    # For a market order, use actual average/cost/filled or matched user trades;
+    # never substitute the requested price or the latest ticker as a fake fill.
+    average = order.get("average")
     if average:
         return float(average)
-    try:
-        fetched = ex.fetch_order(order["id"], symbol)
-        if fetched.get("average"):
-            return float(fetched["average"])
-    except Exception:
-        pass
-    # Do not silently pretend the candle close was the fill. Query the live ticker.
-    return float(ex.fetch_ticker(symbol)["last"])
+    order_id = order.get("id")
+    if order_id:
+        try:
+            fetched = ex.fetch_order(order_id, symbol)
+            if fetched.get("average"):
+                return float(fetched["average"])
+            if fetched.get("filled") and fetched.get("cost"):
+                return float(fetched["cost"]) / float(fetched["filled"])
+        except Exception as exc:
+            log.warning("[%s] Could not retrieve order average fill: %s", symbol, exc)
+        try:
+            since = int(order.get("timestamp") or (time.time() * 1000)) - 10_000
+            fills = ex.fetch_my_trades(symbol, since=since)
+            matching = [t for t in fills if str(t.get("order")) == str(order_id)]
+            qty = sum(float(t.get("amount") or 0) for t in matching)
+            value = sum(float(t.get("amount") or 0) * float(t.get("price") or 0) for t in matching)
+            if qty > 0:
+                return value / qty
+        except Exception as exc:
+            log.warning("[%s] Could not calculate average from fills: %s", symbol, exc)
+    raise RuntimeError(f"Could not verify average fill price for {symbol}; reconcile order {order_id} manually.")
 
 
 def get_trade_pnl(ex, symbol, opened_ms, entry_side):
-    pnl = 0.0
+    realized_pnl = 0.0
     exit_qty = 0.0
     exit_value = 0.0
     closed_ms = int(time.time() * 1000)
     exit_side = "sell" if entry_side == "buy" else "buy"
-    try:
-        fills = ex.fetch_my_trades(symbol, since=opened_ms - 5000)
-        for trade in fills:
-            info = trade.get("info") or {}
-            pnl += float(info.get("realizedPnl") or 0)
-            fee = trade.get("fee") or {}
-            if fee.get("currency") == "USDT":
-                pnl -= float(fee.get("cost") or 0)
-            if trade.get("side") == exit_side:
-                amount = float(trade.get("amount") or 0)
-                exit_qty += amount
-                exit_value += amount * float(trade.get("price") or 0)
-                closed_ms = max(closed_ms, int(trade.get("timestamp") or closed_ms))
-    except Exception as exc:
-        log.warning("[%s] Could not fully retrieve realized PnL: %s", symbol, exc)
-        return None, None, closed_ms
-    exit_price = exit_value / exit_qty if exit_qty else None
-    return pnl, exit_price, closed_ms
+    fills = ex.fetch_my_trades(symbol, since=opened_ms - 5000)
+    if not fills:
+        raise RuntimeError("No user fills returned for completed trade.")
+    for trade in fills:
+        info = trade.get("info") or {}
+        realized_pnl += float(info.get("realizedPnl") or 0)
+        fee = trade.get("fee") or {}
+        if fee.get("currency") == "USDT":
+            realized_pnl -= float(fee.get("cost") or 0)
+        if trade.get("side") == exit_side:
+            amount = float(trade.get("amount") or 0)
+            exit_qty += amount
+            exit_value += amount * float(trade.get("price") or 0)
+            closed_ms = max(closed_ms, int(trade.get("timestamp") or closed_ms))
+    if exit_qty <= 0:
+        raise RuntimeError("No exit fills returned for completed trade.")
+    return realized_pnl, exit_value / exit_qty, closed_ms
 
 
-# --------------------------- sizing and execution ---------------------------
-def position_quantity(ex, symbol, reference_price, balance):
-    """
-    Risk budget = 1% equity.
-    Stop price distance = reference price * (STOP_ROI / leverage).
-    Quantity = risk budget / price distance.
-    This makes quantity dynamic with both balance and stop distance.
-    """
-    stop_price_fraction = (STOP_ROI_PCT / 100.0) / LEVERAGE
-    stop_distance = reference_price * stop_price_fraction
-    risk_budget = balance * RISK_PCT / 100.0
+# --------------------------- sizing / orders ---------------------------
+def position_quantity(ex, symbol, reference_price, equity):
+    stop_fraction = (STOP_ROI_PCT / 100.0) / LEVERAGE
+    stop_distance = reference_price * stop_fraction
+    risk_budget = equity * RISK_PCT / 100.0
     if stop_distance <= 0:
         return None, None
-
-    qty = risk_budget / stop_distance
-    qty = float(ex.amount_to_precision(symbol, qty))
+    quantity = float(ex.amount_to_precision(symbol, risk_budget / stop_distance))
     market = ex.market(symbol)
     limits = market.get("limits") or {}
     min_qty = float((limits.get("amount") or {}).get("min") or 0)
     min_cost = float((limits.get("cost") or {}).get("min") or 0)
-    if qty <= 0 or qty < min_qty or qty * reference_price < min_cost:
-        log.info("[%s] Skip: calculated quantity below exchange minimum (qty=%s)", symbol, qty)
+    if quantity <= 0 or quantity < min_qty or quantity * reference_price < min_cost:
+        log.info("[%s] Skip: calculated quantity below exchange minimum (qty=%s)", symbol, quantity)
         return None, None
-
-    # Isolated margin estimate; don't open if required margin exceeds available equity.
-    required_margin = qty * reference_price / LEVERAGE
-    if required_margin > balance * 0.90:
-        log.info("[%s] Skip: required isolated margin %.2f exceeds 90%% of wallet %.2f",
-                 symbol, required_margin, balance)
+    required_margin = quantity * reference_price / LEVERAGE
+    if required_margin > equity * 0.90:
+        log.info("[%s] Skip: required isolated margin %.2f exceeds 90%% of equity %.2f",
+                 symbol, required_margin, equity)
         return None, None
-
-    return qty, risk_budget
+    return quantity, risk_budget
 
 
 def place_market_entry(ex, symbol, side, reference_price, reason):
-    balance = get_balance(ex)
-    if balance < MIN_BALANCE_USDT:
-        log.warning("Balance %.2f below minimum; no trade.", balance)
+    equity = get_equity(ex)
+    if equity < MIN_BALANCE_USDT:
+        log.warning("Equity %.2f below minimum; no trade.", equity)
         return None
-
-    qty, risk_budget = position_quantity(ex, symbol, reference_price, balance)
-    if qty is None:
+    quantity, risk_budget = position_quantity(ex, symbol, reference_price, equity)
+    if quantity is None:
         return None
-
-    log.info("[%s] Sending MARKET %s qty=%s (estimated risk %.4f USDT)",
-             symbol, side.upper(), qty, risk_budget)
-    order = ex.create_order(symbol, "market", side, qty)
+    try:
+        pre_order_ticker = ex.fetch_ticker(symbol)
+        pre_order_price = float(pre_order_ticker.get("last") or pre_order_ticker.get("close"))
+        if pre_order_price <= 0:
+            pre_order_price = None
+    except Exception as exc:
+        pre_order_price = None
+        log.warning("[%s] Could not capture pre-entry quote for slippage: %s", symbol, exc)
+    log.info("[%s] Sending DEMO MARKET %s qty=%s (estimated risk %.4f USDT)",
+             symbol, side.upper(), quantity, risk_budget)
+    order = ex.create_order(symbol, "market", side, quantity)
     fill = fetch_fill_price(ex, symbol, order)
-
     stop_move = (STOP_ROI_PCT / 100.0) / LEVERAGE
     target_move = (TAKE_PROFIT_ROI_PCT / 100.0) / LEVERAGE
     if side == "buy":
-        sl = fill * (1.0 - stop_move)
-        tp = fill * (1.0 + target_move)
+        stop_loss, take_profit = fill * (1.0 - stop_move), fill * (1.0 + target_move)
     else:
-        sl = fill * (1.0 + stop_move)
-        tp = fill * (1.0 - target_move)
-
-    sl = float(ex.price_to_precision(symbol, sl))
-    tp = float(ex.price_to_precision(symbol, tp))
-    actual_risk = abs(fill - sl) * qty
+        stop_loss, take_profit = fill * (1.0 + stop_move), fill * (1.0 - target_move)
+    stop_loss = float(ex.price_to_precision(symbol, stop_loss))
+    take_profit = float(ex.price_to_precision(symbol, take_profit))
+    entry_slippage_pct = (((fill - pre_order_price) / pre_order_price) * 100.0
+                          * (1.0 if side == "buy" else -1.0)) if pre_order_price else None
     state = {
         "symbol": symbol,
         "side": side,
-        "qty": qty,
+        "qty": quantity,
         "entry": fill,
-        "sl": sl,
-        "tp": tp,
-        "risk_usdt": actual_risk,
-        "opened_ms": int(time.time() * 1000),
+        "signal_reference_price": float(reference_price),
+        "pre_order_price": pre_order_price,
+        "entry_slippage_pct": entry_slippage_pct,
+        "sl": stop_loss,
+        "tp": take_profit,
+        "risk_usdt": abs(fill - stop_loss) * quantity,
+        "opened_ms": int(order.get("timestamp") or time.time() * 1000),
         "opened_utc": utc_now(),
+        "opened_ist": ist_now_iso(),
         "reason": reason,
         "entry_order_id": order.get("id"),
     }
     log.info("[%s] OPEN %s | fill=%s qty=%s SL=%s TP=%s | planned R:R=1:1",
-             symbol, side.upper(), fill, qty, state["sl"], state["tp"])
+             symbol, side.upper(), fill, quantity, stop_loss, take_profit)
     return state
 
 
 def close_position_market(ex, state, exit_reason):
     symbol = state["symbol"]
     exit_side = "sell" if state["side"] == "buy" else "buy"
-    qty = float(state["qty"])
-    log.warning("[%s] MARKET EXIT %s: %s", symbol, exit_side.upper(), exit_reason)
-    order = ex.create_order(symbol, "market", exit_side, qty, None, {"reduceOnly": True})
+    quantity = float(state["qty"])
+    try:
+        ticker = ex.fetch_ticker(symbol)
+        reference_exit = float(ticker.get("last") or ticker.get("close"))
+    except Exception as exc:
+        reference_exit = None
+        log.warning("[%s] Could not capture pre-exit reference price for slippage: %s", symbol, exc)
+    log.warning("[%s] DEMO MARKET EXIT %s: %s", symbol, exit_side.upper(), exit_reason)
+    order = ex.create_order(symbol, "market", exit_side, quantity, None, {"reduceOnly": True})
     exit_price = fetch_fill_price(ex, symbol, order)
-    return exit_price, order
+    return exit_price, order, reference_exit
 
 
-# --------------------------- reporting ---------------------------
+# --------------------------- risk state ---------------------------
+def reconstruct_day_counters(trades, day_key):
+    entries, losses = 0, 0
+    for trade in trades:
+        opened = parse_iso(trade.get("opened_ist") or trade.get("opened_utc"))
+        closed = parse_iso(trade.get("closed_ist") or trade.get("closed_utc"))
+        if opened and ist_day_key(opened) == day_key:
+            entries += 1
+        if closed and ist_day_key(closed) == day_key and (trade.get("risk_loss") is True or float(trade.get("pnl_usdt") or 0) < 0):
+            losses += 1
+    return entries, losses
+
+
+def initialize_risk_state(equity, trades):
+    today = ist_day_key()
+    entries, losses = reconstruct_day_counters(trades, today)
+    state = {
+        "schema_version": 2,
+        "day_ist": today,
+        "day_start_equity": equity,
+        "day_end_equity": equity,
+        "daily_trades": entries,
+        "daily_losses": losses,
+        "daily_halted": entries >= MAX_TRADES_PER_DAY or losses >= MAX_LOSING_TRADES_PER_DAY,
+        "daily_halt_reason": "RECONSTRUCTED_DAILY_LIMIT" if entries >= MAX_TRADES_PER_DAY or losses >= MAX_LOSING_TRADES_PER_DAY else "",
+        "daily_drawdown_breached": False,
+        "cooldowns": {},
+        "overall_peak_equity": equity,
+        "overall_halted": False,
+        "overall_halt_reason": "",
+        "last_equity": equity,
+        "last_equity_ist": ist_now_iso(),
+        "daily_drawdown_pct": 0.0,
+        "max_daily_drawdown_pct": 0.0,
+        "overall_drawdown_pct": 0.0,
+        "max_overall_drawdown_pct": 0.0,
+        "last_candle_ts": {},
+        "reports": {},
+    }
+    log.warning("Created new risk_state.json. Overall high-water mark starts at current equity %.4f USDT; prior peak cannot be reconstructed.", equity)
+    return state
+
+
+def reset_daily_state(risk_state, equity, new_day):
+    risk_state.update({
+        "day_ist": new_day,
+        "day_start_equity": equity,
+        "day_end_equity": equity,
+        "daily_trades": 0,
+        "daily_losses": 0,
+        "daily_halted": False,
+        "daily_halt_reason": "",
+        "daily_drawdown_breached": False,
+        "daily_drawdown_pct": 0.0,
+        "max_daily_drawdown_pct": 0.0,
+    })
+    # Cooldowns and the account high-water mark carry across IST midnight.
+    return risk_state
+
+
+def update_equity_metrics(risk_state, equity):
+    day_start = float(risk_state.get("day_start_equity") or equity)
+    peak = max(float(risk_state.get("overall_peak_equity") or equity), equity)
+    risk_state["overall_peak_equity"] = peak
+    risk_state["last_equity"] = equity
+    risk_state["last_equity_ist"] = ist_now_iso()
+    risk_state["day_end_equity"] = equity
+    risk_state["daily_drawdown_pct"] = max(0.0, (day_start - equity) / day_start * 100.0) if day_start > 0 else 0.0
+    risk_state["max_daily_drawdown_pct"] = max(
+        float(risk_state.get("max_daily_drawdown_pct") or 0), risk_state["daily_drawdown_pct"]
+    )
+    risk_state["overall_drawdown_pct"] = max(0.0, (peak - equity) / peak * 100.0) if peak > 0 else 0.0
+    risk_state["max_overall_drawdown_pct"] = max(
+        float(risk_state.get("max_overall_drawdown_pct") or 0), risk_state["overall_drawdown_pct"]
+    )
+    if risk_state["daily_drawdown_pct"] >= DAILY_DRAWDOWN_LIMIT_PCT:
+        if not risk_state.get("daily_drawdown_breached"):
+            log.error("DAILY DRAWDOWN LIMIT reached: %.3f%% >= %.3f%%", risk_state["daily_drawdown_pct"], DAILY_DRAWDOWN_LIMIT_PCT)
+        risk_state["daily_drawdown_breached"] = True
+        risk_state["daily_halted"] = True
+        # Give a drawdown breach priority over the ordinary trade-count halt reason.
+        risk_state["daily_halt_reason"] = "DAILY_DRAWDOWN_LIMIT"
+    if risk_state["overall_drawdown_pct"] >= OVERALL_DRAWDOWN_LIMIT_PCT and not risk_state.get("overall_halted"):
+        risk_state["overall_halted"] = True
+        risk_state["overall_halt_reason"] = "OVERALL_DRAWDOWN_LIMIT"
+        log.critical("OVERALL DRAWDOWN LIMIT reached: %.3f%% >= %.3f%%. Permanent halt set.", risk_state["overall_drawdown_pct"], OVERALL_DRAWDOWN_LIMIT_PCT)
+    save_risk_state(risk_state)
+    return risk_state
+
+
+def daily_entry_block_reason(risk_state, symbol=None):
+    if risk_state.get("overall_halted"):
+        return "OVERALL_DRAWDOWN_HALT"
+    if risk_state.get("daily_halted"):
+        return risk_state.get("daily_halt_reason") or "DAILY_HALT"
+    if int(risk_state.get("daily_trades", 0)) >= MAX_TRADES_PER_DAY:
+        risk_state["daily_halted"] = True
+        risk_state["daily_halt_reason"] = "MAX_TRADES_REACHED"
+        save_risk_state(risk_state)
+        return "MAX_TRADES_REACHED"
+    if int(risk_state.get("daily_losses", 0)) >= MAX_LOSING_TRADES_PER_DAY:
+        risk_state["daily_halted"] = True
+        risk_state["daily_halt_reason"] = "TWO_LOSSES_REACHED"
+        save_risk_state(risk_state)
+        return "TWO_LOSSES_REACHED"
+    if symbol:
+        expiry = parse_iso((risk_state.get("cooldowns") or {}).get(symbol))
+        if expiry and now_ist() < expiry:
+            return f"SYMBOL_COOLDOWN_UNTIL_{expiry.strftime('%H:%M:%S')}_IST"
+    return ""
+
+
+def record_trade_entry(risk_state, active):
+    # Persist the entry counter before the active state. If the process crashes in
+    # between, startup detects the exchange position as unmanaged and halts safely,
+    # while the daily trade count is not silently lost.
+    risk_state["daily_trades"] = int(risk_state.get("daily_trades", 0)) + 1
+    active["entry_day_ist"] = ist_day_key()
+    if risk_state["daily_trades"] >= MAX_TRADES_PER_DAY:
+        risk_state["daily_halted"] = True
+        risk_state["daily_halt_reason"] = "MAX_TRADES_REACHED"
+    save_risk_state(risk_state)
+    save_active_state(active)
+
+
+def close_and_record_trade(ex, active, exit_reason, trades, risk_state):
+    """Close one managed position, reconcile realized PnL, then persist its completed trade."""
+    exit_price, exit_order, reference_exit = close_position_market(ex, active, exit_reason)
+    pnl_accuracy = "exchange_realized_pnl_after_usdt_fees"
+    try:
+        pnl, average_exit, closed_ms = get_trade_pnl(
+            ex, active["symbol"], int(active["opened_ms"]), active["side"]
+        )
+    except Exception as exc:
+        direction = 1 if active["side"] == "buy" else -1
+        pnl = (exit_price - float(active["entry"])) * float(active["qty"]) * direction
+        average_exit = exit_price
+        closed_ms = int(time.time() * 1000)
+        pnl_accuracy = "estimated_gross_before_fees"
+        log.error("[%s] Could not retrieve exchange realized PnL/fees; fallback PnL excludes fees: %s",
+                  active["symbol"], exc)
+
+    closed_dt = datetime.fromtimestamp(closed_ms / 1000, tz=timezone.utc).astimezone(IST)
+    is_risk_loss = float(pnl) < 0 or pnl_accuracy != "exchange_realized_pnl_after_usdt_fees"
+    exit_side = "sell" if active["side"] == "buy" else "buy"
+    exit_slippage_pct = None
+    if reference_exit and reference_exit > 0:
+        exit_slippage_pct = (((float(average_exit or exit_price) - reference_exit) / reference_exit) * 100.0
+                             * (-1.0 if exit_side == "sell" else 1.0))
+    trade = {
+        "n": (int(trades[-1].get("n", 0)) + 1) if trades else 1,
+        "symbol": active["symbol"],
+        "side": active["side"],
+        "opened_utc": active.get("opened_utc"),
+        "opened_ist": active.get("opened_ist"),
+        "closed_utc": datetime.fromtimestamp(closed_ms / 1000, tz=timezone.utc).isoformat(),
+        "closed_ist": closed_dt.isoformat(),
+        "entry": float(active["entry"]),
+        "exit": float(average_exit or exit_price),
+        "entry_slippage_pct": active.get("entry_slippage_pct"),
+        "exit_slippage_pct": exit_slippage_pct,
+        "sl": float(active["sl"]),
+        "tp": float(active["tp"]),
+        "qty": float(active["qty"]),
+        "risk_usdt": float(active.get("risk_usdt") or 0),
+        "pnl_usdt": float(pnl),
+        "pnl_accuracy": pnl_accuracy,
+        "risk_loss": is_risk_loss,
+        "r_multiple": (float(pnl) / float(active["risk_usdt"])) if active.get("risk_usdt") else None,
+        "result": exit_reason,
+        "reason": active.get("reason", ""),
+        "entry_order_id": active.get("entry_order_id"),
+        "exit_order_id": exit_order.get("id"),
+    }
+    trades.append(trade)
+    save_trade_log(trades)
+
+    # If exchange realized PnL/fees could not be retrieved, classify the result
+    # conservatively as a loss for risk limits (fallback PnL is gross, before fees).
+    if is_risk_loss:
+        risk_state["daily_losses"] = int(risk_state.get("daily_losses", 0)) + 1
+        expiry = now_ist() + timedelta(minutes=LOSS_COOLDOWN_MINUTES)
+        risk_state.setdefault("cooldowns", {})[active["symbol"]] = expiry.isoformat()
+        log.warning("[%s] Losing trade. %d/%d daily losses. Symbol cooldown until %s IST.",
+                    active["symbol"], risk_state["daily_losses"], MAX_LOSING_TRADES_PER_DAY,
+                    expiry.strftime("%H:%M:%S"))
+    if int(risk_state.get("daily_losses", 0)) >= MAX_LOSING_TRADES_PER_DAY:
+        risk_state["daily_halted"] = True
+        risk_state["daily_halt_reason"] = "TWO_LOSSES_REACHED"
+    save_active_state({})
+    save_risk_state(risk_state)
+    log.info("CLOSED %s | %s | PnL=%.5f USDT (%s) | daily entries=%d losses=%d",
+             trade["symbol"], exit_reason, pnl, pnl_accuracy,
+             risk_state.get("daily_trades", 0), risk_state.get("daily_losses", 0))
+    if REPORT_EVERY_N_TRADES and len(trades) % REPORT_EVERY_N_TRADES == 0:
+        write_periodic_pdf_report(trades, float(risk_state.get("last_equity") or 0))
+    return trade
+
+
+# --------------------------- periodic PDF ---------------------------
 def trade_stats(trades):
     count = len(trades)
-    wins = sum(1 for t in trades if float(t.get("pnl_usdt") or 0) > 0)
-    gross_profit = sum(float(t.get("pnl_usdt") or 0) for t in trades
-                       if float(t.get("pnl_usdt") or 0) > 0)
-    gross_loss = abs(sum(float(t.get("pnl_usdt") or 0) for t in trades
-                         if float(t.get("pnl_usdt") or 0) < 0))
+    values = [float(t.get("pnl_usdt") or 0) for t in trades]
+    wins = sum(1 for trade, value in zip(trades, values) if value > 0 and not trade.get("risk_loss", False))
+    losses_count = sum(1 for trade, value in zip(trades, values) if trade.get("risk_loss", False) or value < 0)
+    gross_profit = sum(value for value in values if value > 0)
+    gross_loss = abs(sum(value for value in values if value < 0))
     return {
         "trades": count,
         "wins": wins,
-        "losses": count - wins,
-        "win_rate_pct": (wins / count * 100) if count else 0.0,
-        "net_pnl_usdt": sum(float(t.get("pnl_usdt") or 0) for t in trades),
-        "profit_factor": (gross_profit / gross_loss) if gross_loss else None,
+        "losses": losses_count,
+        "breakeven": count - wins - losses_count,
+        "win_rate_pct": wins / count * 100 if count else 0.0,
+        "net_pnl_usdt": sum(values),
+        "profit_factor": gross_profit / gross_loss if gross_loss else None,
     }
 
 
-def write_pdf_report(trades, balance):
+def write_periodic_pdf_report(trades, equity):
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4, landscape
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.lib.units import mm
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-
         batch = trades[-REPORT_EVERY_N_TRADES:]
-        path = os.path.join(BASE_DIR, f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+        path = os.path.join(BASE_DIR, f"trade_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
         styles = getSampleStyleSheet()
-        story = [
-            Paragraph("Chan-Inspired Crypto Mean-Reversion Bot — DEMO Report", styles["Title"]),
-            Paragraph(f"Generated {utc_now()} | Balance {balance:.2f} USDT", styles["Normal"]),
-            Spacer(1, 6),
-        ]
         stats = trade_stats(trades)
-        story.append(Paragraph(
-            f"Trades: {stats['trades']} | Win rate: {stats['win_rate_pct']:.1f}% | "
-            f"Net PnL: {stats['net_pnl_usdt']:.4f} USDT | "
-            f"Profit factor: {stats['profit_factor'] if stats['profit_factor'] is not None else 'n/a'}",
-            styles["Normal"]))
-        rows = [["#", "Symbol", "Side", "Entry", "Exit", "SL", "TP", "Qty", "PnL USDT", "Result"]]
-        for trade in batch:
-            rows.append([
-                str(trade.get("n")), trade.get("symbol"), trade.get("side"),
-                str(trade.get("entry")), str(trade.get("exit")),
-                str(trade.get("sl")), str(trade.get("tp")),
-                str(trade.get("qty")), f"{float(trade.get('pnl_usdt') or 0):.4f}",
-                trade.get("result"),
-            ])
+        story = [Paragraph("Chan-Inspired Mean-Reversion Bot — DEMO Trade Batch", styles["Title"]),
+                 Paragraph(f"Generated {utc_now()} | Equity {equity:.4f} USDT", styles["Normal"]), Spacer(1, 6),
+                 Paragraph(f"Total trades: {stats['trades']} | Win rate: {stats['win_rate_pct']:.1f}% | "
+                           f"Net PnL: {stats['net_pnl_usdt']:.4f} USDT", styles["Normal"])]
+        rows = [["#", "Symbol", "Side", "Entry", "Exit", "Qty", "PnL USDT", "Accuracy", "Result"]]
+        for t in batch:
+            rows.append([str(t.get("n")), t.get("symbol"), t.get("side"), str(t.get("entry")),
+                         str(t.get("exit")), str(t.get("qty")), f"{float(t.get('pnl_usdt') or 0):.4f}",
+                         t.get("pnl_accuracy", ""), t.get("result", "")])
         table = Table(rows, repeatRows=1)
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
-            ("FONTSIZE", (0, 0), (-1, -1), 7),
-        ]))
+        table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                                   ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                                   ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+                                   ("FONTSIZE", (0, 0), (-1, -1), 7)]))
         story.append(table)
-        doc = SimpleDocTemplate(path, pagesize=landscape(A4), leftMargin=10*mm,
-                                rightMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm)
-        doc.build(story)
-        log.info("PDF report saved: %s", path)
+        SimpleDocTemplate(path, pagesize=landscape(A4), leftMargin=8*mm, rightMargin=8*mm,
+                          topMargin=8*mm, bottomMargin=8*mm).build(story)
+        log.info("Periodic PDF report saved: %s", path)
     except ImportError:
-        log.info("Optional PDF report skipped; install reportlab to enable it.")
+        log.warning("Periodic PDF skipped: install reportlab.")
+    except Exception:
+        log.exception("Periodic PDF report failed.")
+
+
+# --------------------------- daily report / Telegram ---------------------------
+def trades_closed_on(trades, day_key):
+    result = []
+    for trade in trades:
+        closed = parse_iso(trade.get("closed_ist") or trade.get("closed_utc"))
+        if closed and ist_day_key(closed) == day_key:
+            result.append(trade)
+    return result
+
+
+def daily_report_text(day_key, day_trades, risk_state, active=None):
+    stats = trade_stats(day_trades)
+    start_equity = float(risk_state.get("day_start_equity") or 0)
+    end_equity = float(risk_state.get("day_end_equity") or risk_state.get("last_equity") or start_equity)
+    daily_dd = float(risk_state.get("daily_drawdown_pct") or 0)
+    overall_dd = float(risk_state.get("overall_drawdown_pct") or 0)
+    reason = risk_state.get("daily_halt_reason") or ("OVERALL_DRAWDOWN_HALT" if risk_state.get("overall_halted") else "No daily halt")
+    entry_slips = [float(t["entry_slippage_pct"]) for t in day_trades if t.get("entry_slippage_pct") is not None]
+    exit_slips = [float(t["exit_slippage_pct"]) for t in day_trades if t.get("exit_slippage_pct") is not None]
+    avg_entry_slip = sum(entry_slips) / len(entry_slips) if entry_slips else None
+    avg_exit_slip = sum(exit_slips) / len(exit_slips) if exit_slips else None
+    lines = [
+        f"📊 DAILY DEMO TRADING REPORT — {day_key} (IST)",
+        "Strategy: Chan-inspired mean reversion | Market: Binance USDT-M Demo",
+        f"Entries opened today: {int(risk_state.get('daily_trades', 0))}/{MAX_TRADES_PER_DAY}",
+        f"Trades closed today: {stats['trades']} | Wins: {stats['wins']} | Losses: {stats['losses']} | Breakeven: {stats['breakeven']}",
+        f"Win rate: {stats['win_rate_pct']:.2f}%",
+        f"Net realized PnL: {stats['net_pnl_usdt']:+.5f} USDT",
+        f"Average adverse entry slippage: {avg_entry_slip:+.5f}%" if avg_entry_slip is not None else "Average adverse entry slippage: n/a",
+        f"Average adverse exit slippage: {avg_exit_slip:+.5f}%" if avg_exit_slip is not None else "Average adverse exit slippage: n/a",
+        f"Profit factor: {stats['profit_factor']:.3f}" if stats["profit_factor"] is not None else "Profit factor: n/a",
+        f"Start-of-day equity: {start_equity:.5f} USDT",
+        f"Last recorded day-end equity: {end_equity:.5f} USDT",
+        f"Current / max daily drawdown: {daily_dd:.3f}% / {float(risk_state.get('max_daily_drawdown_pct') or daily_dd):.3f}% (limit {DAILY_DRAWDOWN_LIMIT_PCT:.1f}%)",
+        f"Current / max overall drawdown: {overall_dd:.3f}% / {float(risk_state.get('max_overall_drawdown_pct') or overall_dd):.3f}% (limit {OVERALL_DRAWDOWN_LIMIT_PCT:.1f}%)",
+        f"Losing trades today: {int(risk_state.get('daily_losses', 0))}/{MAX_LOSING_TRADES_PER_DAY}",
+        f"Trading status: {'HALTED' if risk_state.get('daily_halted') or risk_state.get('overall_halted') else 'ELIGIBLE'}",
+        f"Halt reason: {reason}",
+    ]
+    if day_trades:
+        lines.append("\nCLOSED TRADES:")
+        for trade in day_trades:
+            lines.append(
+                f"• {trade.get('symbol')} {str(trade.get('side', '')).upper()} | "
+                f"PnL {float(trade.get('pnl_usdt') or 0):+.5f} USDT | "
+                f"{trade.get('result')} | entry slip {trade.get('entry_slippage_pct')}% | "
+                f"exit slip {trade.get('exit_slippage_pct')}% | {trade.get('pnl_accuracy', 'PnL accuracy unknown')}"
+            )
+    else:
+        lines.append("\nNo completed trades were recorded for this IST date.")
+    if active:
+        lines.append(
+            f"\nOPEN POSITION AT REPORT TIME: {active.get('symbol')} "
+            f"{str(active.get('side', '')).upper()} | entry {active.get('entry')} | "
+            f"SL {active.get('sl')} | TP {active.get('tp')} | qty {active.get('qty')}. "
+            "Bot continues managing it after this report."
+        )
+    lines.append("\nRisk note: PnL fallback estimates, if any, may exclude fees. Check the attached PDF and exchange history.")
+    return "\n".join(lines)
+
+
+def write_daily_pdf_report(day_key, day_trades, risk_state, active=None):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    os.makedirs(DAILY_REPORT_DIR, exist_ok=True)
+    path = os.path.join(DAILY_REPORT_DIR, f"daily_report_{day_key}.pdf")
+    styles = getSampleStyleSheet()
+    stats = trade_stats(day_trades)
+    start_equity = float(risk_state.get("day_start_equity") or 0)
+    end_equity = float(risk_state.get("day_end_equity") or risk_state.get("last_equity") or start_equity)
+    story = [
+        Paragraph("Daily Trading Report — Binance DEMO USDT-M Futures", styles["Title"]),
+        Paragraph(f"Trading date: {day_key} (Asia/Kolkata) | Generated: {ist_now_iso()}", styles["Normal"]),
+        Spacer(1, 8),
+    ]
+    entry_slips = [float(t["entry_slippage_pct"]) for t in day_trades if t.get("entry_slippage_pct") is not None]
+    exit_slips = [float(t["exit_slippage_pct"]) for t in day_trades if t.get("exit_slippage_pct") is not None]
+    avg_entry_slip = sum(entry_slips) / len(entry_slips) if entry_slips else None
+    avg_exit_slip = sum(exit_slips) / len(exit_slips) if exit_slips else None
+    summary_rows = [
+        ["Metric", "Value"],
+        ["Entries opened", f"{int(risk_state.get('daily_trades', 0))}/{MAX_TRADES_PER_DAY}"],
+        ["Trades closed", str(stats["trades"])],
+        ["Wins / losses", f"{stats['wins']} / {stats['losses']}"],
+        ["Win rate", f"{stats['win_rate_pct']:.2f}%"],
+        ["Net realized PnL", f"{stats['net_pnl_usdt']:+.5f} USDT"],
+        ["Average entry slippage (adverse positive)", f"{avg_entry_slip:+.5f}%" if avg_entry_slip is not None else "n/a"],
+        ["Average exit slippage (adverse positive)", f"{avg_exit_slip:+.5f}%" if avg_exit_slip is not None else "n/a"],
+        ["Profit factor", f"{stats['profit_factor']:.3f}" if stats["profit_factor"] is not None else "n/a"],
+        ["Start-of-day equity", f"{start_equity:.5f} USDT"],
+        ["Last recorded day-end equity", f"{end_equity:.5f} USDT"],
+        ["Current / max daily drawdown", f"{float(risk_state.get('daily_drawdown_pct') or 0):.3f}% / {float(risk_state.get('max_daily_drawdown_pct') or 0):.3f}% (limit {DAILY_DRAWDOWN_LIMIT_PCT:.1f}%)"],
+        ["Current / max overall drawdown", f"{float(risk_state.get('overall_drawdown_pct') or 0):.3f}% / {float(risk_state.get('max_overall_drawdown_pct') or 0):.3f}% (limit {OVERALL_DRAWDOWN_LIMIT_PCT:.1f}%)"],
+        ["Daily losing trades", f"{int(risk_state.get('daily_losses', 0))}/{MAX_LOSING_TRADES_PER_DAY}"],
+        ["Daily halt reason", risk_state.get("daily_halt_reason") or "None"],
+        ["Overall halt", "YES — manual review required" if risk_state.get("overall_halted") else "No"],
+    ]
+    summary = Table(summary_rows, colWidths=[65*mm, 100*mm], repeatRows=1)
+    summary.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                                 ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+                                 ("FONTSIZE", (0, 0), (-1, -1), 8),
+                                 ("PADDING", (0, 0), (-1, -1), 5)]))
+    story.extend([Paragraph("Daily summary", styles["Heading2"]), summary, Spacer(1, 10),
+                  Paragraph("Completed trades", styles["Heading2"])])
+    rows = [["#", "Symbol", "Side", "Opened (IST)", "Closed (IST)", "Entry", "Exit", "Qty", "PnL USDT", "Entry slip %", "Exit slip %", "Exit reason", "PnL source"]]
+    for trade in day_trades:
+        rows.append([
+            str(trade.get("n", "")), trade.get("symbol", ""), str(trade.get("side", "")).upper(),
+            (trade.get("opened_ist") or "")[:19].replace("T", " "),
+            (trade.get("closed_ist") or "")[:19].replace("T", " "),
+            f"{float(trade.get('entry') or 0):.8g}", f"{float(trade.get('exit') or 0):.8g}",
+            f"{float(trade.get('qty') or 0):.8g}", f"{float(trade.get('pnl_usdt') or 0):+.5f}",
+            f"{float(trade.get('entry_slippage_pct')):+.5f}" if trade.get("entry_slippage_pct") is not None else "n/a",
+            f"{float(trade.get('exit_slippage_pct')):+.5f}" if trade.get("exit_slippage_pct") is not None else "n/a",
+            trade.get("result", ""), trade.get("pnl_accuracy", ""),
+        ])
+    if not day_trades:
+        rows.append(["—", "No completed trades", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—"])
+    detail = Table(rows, colWidths=[8*mm, 23*mm, 12*mm, 24*mm, 24*mm, 18*mm, 18*mm,
+                                    16*mm, 18*mm, 17*mm, 17*mm, 22*mm, 36*mm], repeatRows=1)
+    detail.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                                ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+                                ("FONTSIZE", (0, 0), (-1, -1), 6),
+                                ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    story.extend([detail, Spacer(1, 10)])
+    if active:
+        open_rows = [["Open position", "Side", "Entry", "Stop", "Target", "Quantity"],
+                     [active.get("symbol", ""), str(active.get("side", "")).upper(),
+                      str(active.get("entry", "")), str(active.get("sl", "")),
+                      str(active.get("tp", "")), str(active.get("qty", ""))]]
+        open_table = Table(open_rows, repeatRows=1)
+        open_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+                                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                                        ("GRID", (0, 0), (-1, -1), 0.3, colors.grey),
+                                        ("FONTSIZE", (0, 0), (-1, -1), 7)]))
+        story.extend([Paragraph("Position still open at report time", styles["Heading2"]), open_table, Spacer(1, 8)])
+    story.append(Paragraph("Risk settings: 3 entries/day; stop after 2 losing trades; 2.5% daily drawdown; "
+                            "8% overall drawdown from persisted equity high-water mark; 15-minute per-symbol "
+                            "cooldown after a losing trade. Bot-managed exits require the bot and network to remain online.",
+                            styles["Italic"]))
+    SimpleDocTemplate(path, pagesize=landscape(A4), leftMargin=7*mm, rightMargin=7*mm,
+                      topMargin=8*mm, bottomMargin=8*mm).build(story)
+    return path
+
+
+def telegram_post(method, fields=None, file_path=None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Telegram not configured: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    if file_path:
+        boundary = "----ChatGPTBoundary" + uuid.uuid4().hex
+        body = bytearray()
+        for key, value in (fields or {}).items():
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+            body.extend(str(value).encode())
+            body.extend(b"\r\n")
+        filename = os.path.basename(file_path)
+        mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode())
+        body.extend(f"Content-Type: {mime}\r\n\r\n".encode())
+        with open(file_path, "rb") as handle:
+            body.extend(handle.read())
+        body.extend(f"\r\n--{boundary}--\r\n".encode())
+        request = urllib.request.Request(url, data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    else:
+        payload = dict(fields or {})
+        payload["chat_id"] = TELEGRAM_CHAT_ID
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Telegram HTTP {exc.code}: {detail[:500]}") from exc
     except Exception as exc:
-        log.exception("PDF report failed: %s", exc)
+        raise RuntimeError(f"Telegram request failed: {exc}") from exc
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API rejected request: {result}")
+    return result
+
+
+def maybe_send_daily_report(day_key, day_trades, risk_state, active=None):
+    report_state = risk_state.setdefault("reports", {}).setdefault(day_key, {})
+    if report_state.get("text_sent") and report_state.get("pdf_sent"):
+        return
+
+    # Build and persist the PDF once. If reportlab is missing, text delivery can
+    # still proceed and PDF generation will be retried later.
+    pdf_path = report_state.get("pdf_path")
+    if not pdf_path or not os.path.isfile(pdf_path):
+        now_ts = time.time()
+        if now_ts - float(report_state.get("last_pdf_generate_attempt_ts", 0)) >= 60:
+            report_state["last_pdf_generate_attempt_ts"] = now_ts
+            save_risk_state(risk_state)
+            try:
+                pdf_path = write_daily_pdf_report(day_key, day_trades, risk_state, active)
+                report_state["pdf_path"] = pdf_path
+                report_state["pdf_generated"] = True
+                save_risk_state(risk_state)
+            except Exception as exc:
+                report_state["last_pdf_error"] = str(exc)
+                save_risk_state(risk_state)
+                log.exception("Could not generate daily PDF report for %s. Install reportlab if missing.", day_key)
+                pdf_path = None
+        else:
+            pdf_path = None
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        if not report_state.get("missing_telegram_warned"):
+            log.warning("Daily report is saved locally where possible, but Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+            report_state["missing_telegram_warned"] = True
+            save_risk_state(risk_state)
+        return
+
+    now_ts = time.time()
+    # Separate delivery flags reduce duplicate sends if only one of the two Telegram calls succeeds.
+    if not report_state.get("text_sent") and now_ts - float(report_state.get("last_text_attempt_ts", 0)) >= 60:
+        report_state["last_text_attempt_ts"] = now_ts
+        save_risk_state(risk_state)
+        try:
+            message = daily_report_text(day_key, day_trades, risk_state, active)
+            telegram_post("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True})
+            report_state["text_sent"] = True
+            report_state["text_sent_at"] = ist_now_iso()
+            save_risk_state(risk_state)
+            log.info("Telegram daily text report sent for %s.", day_key)
+        except Exception as exc:
+            report_state["last_text_error"] = str(exc)
+            save_risk_state(risk_state)
+            log.error("Telegram text report failed for %s: %s", day_key, exc)
+
+    if pdf_path and not report_state.get("pdf_sent") and now_ts - float(report_state.get("last_pdf_attempt_ts", 0)) >= 60:
+        report_state["last_pdf_attempt_ts"] = now_ts
+        save_risk_state(risk_state)
+        try:
+            telegram_post("sendDocument", {"chat_id": TELEGRAM_CHAT_ID, "caption": f"Daily DEMO report — {day_key} (IST)"}, pdf_path)
+            report_state["pdf_sent"] = True
+            report_state["pdf_sent_at"] = ist_now_iso()
+            save_risk_state(risk_state)
+            log.info("Telegram daily PDF report sent for %s.", day_key)
+        except Exception as exc:
+            report_state["last_pdf_error"] = str(exc)
+            save_risk_state(risk_state)
+            log.error("Telegram PDF report failed for %s: %s", day_key, exc)
+
+
+def maybe_run_daily_report(trades, risk_state, active=None, now=None):
+    now = now or now_ist()
+    day_key = ist_day_key(now)
+    if (now.hour, now.minute) >= (DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE):
+        maybe_send_daily_report(day_key, trades_closed_on(trades, day_key), risk_state, active)
+
+
+def rollover_ist_day(ex, trades, risk_state, equity, today_key, active=None):
+    previous_day = risk_state.get("day_ist")
+    if previous_day and previous_day != today_key:
+        # If the process was stopped at 23:59, send the previous day's report on restart.
+        maybe_send_daily_report(previous_day, trades_closed_on(trades, previous_day), risk_state, active)
+        reset_daily_state(risk_state, equity, today_key)
+        save_risk_state(risk_state)
+        log.info("IST day reset to %s. New start-of-day equity: %.5f USDT", today_key, equity)
+    elif not previous_day:
+        risk_state["day_ist"] = today_key
+        risk_state["day_start_equity"] = equity
+        risk_state["day_end_equity"] = equity
+        save_risk_state(risk_state)
+    return risk_state
 
 
 # --------------------------- main loop ---------------------------
 def main():
+    global SYMBOLS
     ex = make_exchange()
+    SYMBOLS = validate_symbols(ex)
 
-    # Require one-way mode because reduceOnly market exits are used.
+    # This bot's reduceOnly exits require One-way Mode.
     try:
         dual = ex.fapiPrivateGetPositionSideDual()
         if str(dual.get("dualSidePosition")).lower() == "true":
@@ -478,182 +1060,182 @@ def main():
     except SystemExit:
         raise
     except Exception as exc:
-        log.warning("Could not verify position mode; check that Binance is in One-way Mode: %s", exc)
+        raise SystemExit(f"Could not verify Binance One-way Mode safely: {exc}")
 
     for symbol in SYMBOLS:
-        if symbol not in ex.markets:
-            raise SystemExit(f"Symbol unavailable in this Binance market list: {symbol}")
         try:
             ex.set_margin_mode("isolated", symbol)
         except Exception as exc:
             log.info("[%s] Isolated margin setting not changed: %s", symbol, exc)
         ex.set_leverage(LEVERAGE, symbol)
 
-    # Never take over an existing position after restart: its SL/TP state may be unknown.
+    trades = load_trade_log()
+    equity = get_equity(ex)
+    risk_state = load_risk_state()
+    if not risk_state or int(risk_state.get("schema_version", 0)) < 2:
+        risk_state = initialize_risk_state(equity, trades)
+        save_risk_state(risk_state)
+    else:
+        risk_state.setdefault("reports", {})
+        risk_state.setdefault("cooldowns", {})
+        risk_state.setdefault("last_candle_ts", {})
+        risk_state.setdefault("overall_halted", False)
+        risk_state.setdefault("overall_halt_reason", "")
+        risk_state.setdefault("daily_halted", False)
+        risk_state.setdefault("daily_halt_reason", "")
+        risk_state.setdefault("daily_drawdown_breached", False)
+        risk_state.setdefault("daily_trades", 0)
+        risk_state.setdefault("daily_losses", 0)
+        risk_state.setdefault("overall_peak_equity", equity)
+        risk_state.setdefault("day_start_equity", equity)
+        risk_state.setdefault("day_end_equity", equity)
+        risk_state.setdefault("max_daily_drawdown_pct", float(risk_state.get("daily_drawdown_pct") or 0))
+        risk_state.setdefault("max_overall_drawdown_pct", float(risk_state.get("overall_drawdown_pct") or 0))
+
+    active = load_active_state()
     existing = get_open_positions(ex)
     if existing:
+        if not active:
+            raise SystemExit(
+                "Unmanaged Binance position detected. Bot will not guess its stop/target state: "
+                + ", ".join(f"{p['symbol']} ({p['side']} {p['contracts']})" for p in existing)
+                + ". Manage/close it manually and inspect the exchange before restarting."
+            )
+        if len(existing) != 1 or existing[0]["symbol"] != active.get("symbol"):
+            raise SystemExit("Exchange positions do not match saved active_trade_state.json. Manual reconciliation required.")
+        if existing[0]["side"] and existing[0]["side"] != active.get("side"):
+            raise SystemExit("Saved active position side does not match Binance. Manual reconciliation required.")
+        saved_qty = float(active.get("qty") or 0)
+        exchange_qty = float(existing[0].get("contracts") or 0)
+        if saved_qty <= 0 or abs(exchange_qty - saved_qty) > max(1e-8, saved_qty * 0.01):
+            raise SystemExit("Saved active position quantity does not match Binance. Manual reconciliation required.")
+        log.warning("Resuming saved managed position %s after restart; verify Binance position and active state.", active["symbol"])
+    elif active:
         raise SystemExit(
-            "Existing futures position(s) detected. Bot will not take over unmanaged positions: "
-            + ", ".join(f"{p['symbol']} ({p['side']} {p['contracts']})" for p in existing)
-            + ". Close/manage them manually before starting."
+            "Saved active_trade_state.json exists but Binance shows no matching position. "
+            "Trade may have closed while bot was offline; reconcile order history before clearing state."
         )
 
-    # This bot creates no resting orders. If old open orders exist, stop rather than cancel user orders.
+    # No resting orders are created by this bot. Existing orders may be user orders, so do not cancel them.
     for symbol in SYMBOLS:
         open_orders = ex.fetch_open_orders(symbol)
         if open_orders:
-            raise SystemExit(
-                f"Open order(s) already exist for {symbol}. Cancel/review them manually before starting."
-            )
+            raise SystemExit(f"Open order(s) detected for {symbol}. Review/cancel manually before starting.")
 
-    active = load_active_state()
-    if active:
-        raise SystemExit(
-            f"Stale {STATE_JSON} found. Review it and the exchange account; archive/delete it only "
-            "after confirming there is no open position."
-        )
-
-    trades = load_trade_log()
-    day = datetime.now(timezone.utc).date()
-    day_start_balance = get_balance(ex)
-    consecutive_losses = 0
-    last_candle_ts = {symbol: None for symbol in SYMBOLS}
+    today_key = ist_day_key()
+    if risk_state.get("day_ist") != today_key:
+        risk_state = rollover_ist_day(ex, trades, risk_state, equity, today_key, active)
+    else:
+        risk_state = update_equity_metrics(risk_state, equity)
+    save_risk_state(risk_state)
 
     log.info(
-        "STARTED DEMO | balance=%.2f USDT | symbols=%s | timeframe=%s | "
-        "risk=%.2f%% | stop=%.2f%% ROI | target=%.2f%% ROI | leverage=%sx",
-        day_start_balance, ", ".join(SYMBOLS), TIMEFRAME, RISK_PCT,
-        STOP_ROI_PCT, TAKE_PROFIT_ROI_PCT, LEVERAGE
+        "STARTED BINANCE DEMO | equity=%.5f USDT | symbols=%s | daily entries=%d/%d | losses=%d/%d | "
+        "daily DD limit=%.2f%% | overall DD limit=%.2f%% | IST report=%02d:%02d",
+        equity, ", ".join(SYMBOLS), risk_state.get("daily_trades", 0), MAX_TRADES_PER_DAY,
+        risk_state.get("daily_losses", 0), MAX_LOSING_TRADES_PER_DAY,
+        DAILY_DRAWDOWN_LIMIT_PCT, OVERALL_DRAWDOWN_LIMIT_PCT,
+        DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE,
     )
 
     while True:
         try:
-            current_day = datetime.now(timezone.utc).date()
-            if current_day != day:
-                day = current_day
-                day_start_balance = get_balance(ex)
-                consecutive_losses = 0
-                log.info("UTC day reset; starting balance %.2f USDT", day_start_balance)
+            now = now_ist()
+            today_key = ist_day_key(now)
+            equity = get_equity(ex)
+            if risk_state.get("day_ist") != today_key:
+                risk_state = rollover_ist_day(ex, trades, risk_state, equity, today_key, active)
+            risk_state = update_equity_metrics(risk_state, equity)
 
-            # Manage active position first. No exchange-side stop/TP orders are placed.
+            # Drawdown breaches close the bot-managed open position before blocking new entries.
+            if active and (risk_state.get("overall_halted") or risk_state.get("daily_drawdown_breached")):
+                reason = "OVERALL_DRAWDOWN_LIMIT" if risk_state.get("overall_halted") else "DAILY_DRAWDOWN_LIMIT"
+                close_and_record_trade(ex, active, reason, trades, risk_state)
+                active = {}
+                equity = get_equity(ex)
+                risk_state = update_equity_metrics(risk_state, equity)
+
+            # Normal stop / target management. These are bot-managed, not exchange-side orders.
             if active:
                 symbol = active["symbol"]
                 ticker = ex.fetch_ticker(symbol)
                 last = float(ticker.get("last") or ticker.get("close"))
-                state = active
-                reason = None
-
-                if state["side"] == "buy":
-                    if last <= state["sl"]:
-                        reason = "STOP_LOSS"
-                    elif last >= state["tp"]:
-                        reason = "TAKE_PROFIT"
+                exit_reason = None
+                if active["side"] == "buy":
+                    if last <= float(active["sl"]):
+                        exit_reason = "STOP_LOSS"
+                    elif last >= float(active["tp"]):
+                        exit_reason = "TAKE_PROFIT"
                 else:
-                    if last >= state["sl"]:
-                        reason = "STOP_LOSS"
-                    elif last <= state["tp"]:
-                        reason = "TAKE_PROFIT"
-
+                    if last >= float(active["sl"]):
+                        exit_reason = "STOP_LOSS"
+                    elif last <= float(active["tp"]):
+                        exit_reason = "TAKE_PROFIT"
                 positions = get_open_positions(ex)
                 still_open = any(p["symbol"] == symbol for p in positions)
-
-                if reason and still_open:
-                    exit_price, exit_order = close_position_market(ex, state, reason)
-                    pnl, avg_exit, closed_ms = get_trade_pnl(
-                        ex, symbol, state["opened_ms"], state["side"]
-                    )
-                    if pnl is None:
-                        direction = 1 if state["side"] == "buy" else -1
-                        pnl = (exit_price - state["entry"]) * state["qty"] * direction
-                        avg_exit = exit_price
-
-                    trade = {
-                        "n": (int(trades[-1].get("n", 0)) + 1) if trades else 1,
-                        "symbol": symbol,
-                        "side": state["side"],
-                        "opened_utc": state["opened_utc"],
-                        "closed_utc": utc_now(),
-                        "entry": state["entry"],
-                        "exit": avg_exit or exit_price,
-                        "sl": state["sl"],
-                        "tp": state["tp"],
-                        "qty": state["qty"],
-                        "risk_usdt": state["risk_usdt"],
-                        "pnl_usdt": float(pnl),
-                        "r_multiple": (float(pnl) / state["risk_usdt"]) if state["risk_usdt"] else None,
-                        "result": reason,
-                        "reason": state["reason"],
-                    }
-                    trades.append(trade)
-                    save_trade_log(trades)
+                if exit_reason and still_open:
+                    close_and_record_trade(ex, active, exit_reason, trades, risk_state)
                     active = {}
-                    save_active_state(active)
-                    consecutive_losses = consecutive_losses + 1 if pnl < 0 else 0
-                    stats = trade_stats(trades)
-                    log.info(
-                        "CLOSED %s | PnL=%.4f USDT | R=%.2f | win rate=%.1f%% | PF=%s",
-                        symbol, pnl, trade["r_multiple"] or 0,
-                        stats["win_rate_pct"],
-                        f"{stats['profit_factor']:.2f}" if stats["profit_factor"] is not None else "n/a",
-                    )
-                    if REPORT_EVERY_N_TRADES and len(trades) % REPORT_EVERY_N_TRADES == 0:
-                        write_pdf_report(trades, get_balance(ex))
-                    if consecutive_losses >= MAX_CONSEC_LOSSES:
-                        raise SystemExit("Maximum consecutive losses reached; stopping bot.")
+                    equity = get_equity(ex)
+                    risk_state = update_equity_metrics(risk_state, equity)
                 elif not still_open:
-                    log.warning(
-                        "[%s] Position disappeared from exchange without bot exit. "
-                        "Check Binance order history and reconcile PnL manually.",
-                        symbol
+                    raise RuntimeError(
+                        f"[{symbol}] Saved active position disappeared from Binance without a bot-recorded exit. "
+                        "Stopping for manual trade-history reconciliation."
                     )
-                    active = {}
-                    save_active_state(active)
 
-            # If flat, evaluate each symbol once per newly closed candle.
+            # Daily reporting is independent of whether entries are blocked.
+            maybe_run_daily_report(trades, risk_state, active, now_ist())
+
+            # Scan only when flat and all entry rules permit a new trade.
             if not active:
-                balance = get_balance(ex)
-                daily_loss_pct = ((day_start_balance - balance) / day_start_balance * 100
-                                  if day_start_balance > 0 else 0)
-                if daily_loss_pct >= MAX_DAILY_LOSS_PCT:
-                    log.warning("Daily loss limit reached (%.2f%%); no new entries.", daily_loss_pct)
-                    time.sleep(POLL_SECONDS)
-                    continue
+                block = daily_entry_block_reason(risk_state)
+                if block:
+                    log.info("No new entries: %s", block)
+                else:
+                    for symbol in SYMBOLS:
+                        block = daily_entry_block_reason(risk_state, symbol)
+                        if block:
+                            log.info("[%s] Skip entry: %s", symbol, block)
+                            continue
+                        raw = ex.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLE_LIMIT)
+                        df = prepare_candles(raw)
+                        if df.empty:
+                            continue
+                        candle_ts = int(df.iloc[-1]["ts"])
+                        last_seen = int((risk_state.get("last_candle_ts") or {}).get(symbol, 0))
+                        if candle_ts <= last_seen:
+                            continue
+                        risk_state.setdefault("last_candle_ts", {})[symbol] = candle_ts
+                        save_risk_state(risk_state)
 
-                for symbol in SYMBOLS:
-                    raw = ex.fetch_ohlcv(symbol, TIMEFRAME, limit=CANDLE_LIMIT)
-                    df = prepare_candles(raw)
-                    if df.empty:
-                        continue
-                    candle_ts = int(df.iloc[-1]["ts"])
-                    if candle_ts == last_candle_ts[symbol]:
-                        continue
-                    last_candle_ts[symbol] = candle_ts
+                        signal, explanation = get_signal(df, symbol)
+                        if not signal:
+                            log.info("[%s] NO TRADE | %s", symbol, explanation)
+                            continue
+                        side, reference_price, zscore = signal
+                        log.info("[%s] SIGNAL | %s | reference=%.8g | z=%.2f",
+                                 symbol, side.upper(), reference_price, zscore)
+                        if get_open_positions(ex):
+                            raise RuntimeError("Exchange position appeared before entry; stopping for reconciliation.")
 
-                    signal, explanation = get_signal(df, symbol)
-                    if not signal:
-                        log.info("[%s] NO TRADE | %s", symbol, explanation)
-                        continue
-
-                    side, reference_price, zscore = signal
-                    log.info("[%s] SIGNAL | %s | reference=%.8g | z=%.2f",
-                             symbol, side.upper(), reference_price, zscore)
-
-                    if get_open_positions(ex):
-                        log.warning("Exchange position appeared before entry; skipping.")
-                        break
-
-                    active = place_market_entry(ex, symbol, side, reference_price, explanation)
-                    if active:
-                        save_active_state(active)
-                        break
+                        active = place_market_entry(ex, symbol, side, reference_price, explanation)
+                        if active:
+                            # Persist active position first; then increment the durable daily entry counter.
+                            save_active_state(active)
+                            record_trade_entry(risk_state, active)
+                            break
 
             time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
-            log.warning("Stopped by user. Any open position remains on exchange; manage it immediately.")
+            log.warning("Stopped by user. Any open position remains on Binance Demo; manage it immediately.")
             break
         except ccxt.NetworkError as exc:
-            log.error("Network error: %s. Bot-managed exits may be delayed; check exchange manually.", exc)
+            log.error("Binance network error: %s. Bot-managed stops may be delayed; check Demo account immediately.", exc)
+            time.sleep(5)
+        except ccxt.ExchangeError as exc:
+            log.exception("Binance exchange error: %s. No new order will be attempted until next loop.", exc)
             time.sleep(5)
         except SystemExit:
             raise
