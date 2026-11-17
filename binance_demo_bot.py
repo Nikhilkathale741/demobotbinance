@@ -707,6 +707,7 @@ def close_and_record_trade(ex, active, exit_reason, trades, risk_state):
         risk_state["daily_halt_reason"] = "TWO_LOSSES_REACHED"
     save_active_state({})
     save_risk_state(risk_state)
+    send_trade_telegram_alert("EXIT", trade, risk_state)
     log.info("CLOSED %s | %s | PnL=%.5f USDT (%s) | daily entries=%d losses=%d",
              trade["symbol"], exit_reason, pnl, pnl_accuracy,
              risk_state.get("daily_trades", 0), risk_state.get("daily_losses", 0))
@@ -958,6 +959,131 @@ def telegram_post(method, fields=None, file_path=None):
     return result
 
 
+def send_startup_telegram_test(ex, equity, symbols, risk_state, active=None):
+    """Send one Telegram startup/connection test after startup checks pass."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Startup Telegram test not sent: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.")
+        return False
+
+    status = "RUNNING — monitoring for signals"
+    if risk_state.get("overall_halted"):
+        status = "STARTED BUT HALTED — overall drawdown/manual review required"
+    elif risk_state.get("daily_halted"):
+        status = f"STARTED — entries blocked today ({risk_state.get('daily_halt_reason') or 'daily limit'})"
+    open_position = "None"
+    if active:
+        open_position = (
+            f"{active.get('symbol')} {str(active.get('side', '')).upper()} | "
+            f"entry {float(active.get('entry') or 0):.8g} | "
+            f"SL {float(active.get('sl') or 0):.8g} | TP {float(active.get('tp') or 0):.8g}"
+        )
+    message = (
+        "✅ BINANCE DEMO BOT STARTUP TEST\n"
+        "Telegram connection: SUCCESS\n"
+        "Environment: BINANCE DEMO USDT-M FUTURES (no live trading)\n"
+        f"Status: {status}\n"
+        f"Started (IST): {ist_now_iso()}\n"
+        f"Futures equity: {float(equity):.5f} USDT\n"
+        f"Symbols validated: {len(symbols)}/{len(CANDIDATE_SYMBOLS)}\n"
+        f"Symbols: {', '.join(symbols)}\n"
+        f"Today's entries: {int(risk_state.get('daily_trades', 0))}/{MAX_TRADES_PER_DAY}\n"
+        f"Today's losses: {int(risk_state.get('daily_losses', 0))}/{MAX_LOSING_TRADES_PER_DAY}\n"
+        f"Daily drawdown limit: {DAILY_DRAWDOWN_LIMIT_PCT:.2f}% | "
+        f"Overall drawdown limit: {OVERALL_DRAWDOWN_LIMIT_PCT:.2f}%\n"
+        f"Open position: {open_position}\n"
+        "This is an automatic test message sent once every time the bot starts successfully."
+    )
+    try:
+        telegram_post("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True})
+        log.info("Telegram startup test message sent successfully.")
+        return True
+    except Exception as exc:
+        log.error("Telegram startup test failed: %s", exc)
+        return False
+
+
+def send_trade_telegram_alert(event, trade_data, risk_state):
+    """Send a best-effort, restart-aware Telegram alert for a filled entry or exit."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Trade %s alert not sent: Telegram is not configured.", event)
+        return False
+
+    risk_state.setdefault("trade_alerts", {})
+    order_id = trade_data.get("entry_order_id") if event == "ENTRY" else trade_data.get("exit_order_id")
+    alert_key = f"{event}:{order_id or trade_data.get('symbol', 'unknown')}"
+    alert_state = risk_state["trade_alerts"].setdefault(alert_key, {})
+    if alert_state.get("sent"):
+        return True
+
+    symbol = trade_data.get("symbol", "UNKNOWN")
+    side = str(trade_data.get("side", "")).upper()
+    entry = float(trade_data.get("entry") or 0)
+    stop = float(trade_data.get("sl") or 0)
+    target = float(trade_data.get("tp") or 0)
+    qty = float(trade_data.get("qty") or 0)
+    potential_loss = abs(entry - stop) * qty
+    potential_profit = abs(target - entry) * qty
+
+    if event == "ENTRY":
+        message = (
+            "🟢 BINANCE DEMO — TRADE OPENED\n"
+            f"Symbol: {symbol}\n"
+            f"Position: {side}\n"
+            f"Entry fill: {entry:.8g}\n"
+            f"Quantity: {qty:.8g}\n"
+            f"Stop-loss: {stop:.8g}\n"
+            f"Take-profit: {target:.8g}\n"
+            f"Potential loss at SL: -{potential_loss:.5f} USDT\n"
+            f"Potential profit at TP: +{potential_profit:.5f} USDT\n"
+            f"Entry slippage: {float(trade_data['entry_slippage_pct']):+.5f}%\n"
+            "Estimates exclude fees, funding and any additional slippage.\n"
+            f"Time (IST): {trade_data.get('opened_ist', ist_now_iso())}"
+        ) if trade_data.get("entry_slippage_pct") is not None else (
+            "🟢 BINANCE DEMO — TRADE OPENED\n"
+            f"Symbol: {symbol}\nPosition: {side}\nEntry fill: {entry:.8g}\n"
+            f"Quantity: {qty:.8g}\nStop-loss: {stop:.8g}\nTake-profit: {target:.8g}\n"
+            f"Potential loss at SL: -{potential_loss:.5f} USDT\n"
+            f"Potential profit at TP: +{potential_profit:.5f} USDT\n"
+            "Estimates exclude fees, funding and any additional slippage.\n"
+            f"Time (IST): {trade_data.get('opened_ist', ist_now_iso())}"
+        )
+    else:
+        exit_price = float(trade_data.get("exit") or 0)
+        pnl = float(trade_data.get("pnl_usdt") or 0)
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        message = (
+            "🔴 BINANCE DEMO — POSITION CLOSED\n"
+            f"Symbol: {symbol}\n"
+            f"Position: {side} | Exit order side: {exit_side}\n"
+            f"Entry fill: {entry:.8g}\n"
+            f"Exit fill: {exit_price:.8g}\n"
+            f"Stop-loss: {stop:.8g}\n"
+            f"Take-profit: {target:.8g}\n"
+            f"Potential loss at SL: -{potential_loss:.5f} USDT\n"
+            f"Potential profit at TP: +{potential_profit:.5f} USDT\n"
+            f"Realised PnL: {pnl:+.5f} USDT\n"
+            f"Exit reason: {trade_data.get('result', 'UNKNOWN')}\n"
+            f"PnL source: {trade_data.get('pnl_accuracy', 'unknown')}\n"
+            f"Time (IST): {trade_data.get('closed_ist', ist_now_iso())}"
+        )
+
+    # Save an attempt timestamp before sending; successful delivery is persisted afterward.
+    alert_state["last_attempt_ist"] = ist_now_iso()
+    save_risk_state(risk_state)
+    try:
+        telegram_post("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True})
+        alert_state["sent"] = True
+        alert_state["sent_at_ist"] = ist_now_iso()
+        save_risk_state(risk_state)
+        log.info("Telegram %s alert sent for %s (order=%s).", event, symbol, order_id)
+        return True
+    except Exception as exc:
+        alert_state["last_error"] = str(exc)
+        save_risk_state(risk_state)
+        log.error("Telegram %s alert failed for %s: %s", event, symbol, exc)
+        return False
+
+
 def maybe_send_daily_report(day_key, day_trades, risk_state, active=None):
     report_state = risk_state.setdefault("reports", {}).setdefault(day_key, {})
     if report_state.get("text_sent") and report_state.get("pdf_sent"):
@@ -1077,6 +1203,7 @@ def main():
         save_risk_state(risk_state)
     else:
         risk_state.setdefault("reports", {})
+        risk_state.setdefault("trade_alerts", {})
         risk_state.setdefault("cooldowns", {})
         risk_state.setdefault("last_candle_ts", {})
         risk_state.setdefault("overall_halted", False)
@@ -1137,6 +1264,9 @@ def main():
         DAILY_DRAWDOWN_LIMIT_PCT, OVERALL_DRAWDOWN_LIMIT_PCT,
         DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE,
     )
+
+    # Send one connection/health test after all exchange and state reconciliation checks pass.
+    send_startup_telegram_test(ex, equity, SYMBOLS, risk_state, active)
 
     while True:
         try:
@@ -1224,6 +1354,7 @@ def main():
                             # Persist active position first; then increment the durable daily entry counter.
                             save_active_state(active)
                             record_trade_entry(risk_state, active)
+                            send_trade_telegram_alert("ENTRY", active, risk_state)
                             break
 
             time.sleep(POLL_SECONDS)
